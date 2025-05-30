@@ -1,0 +1,14 @@
+site_name: NovaPipe
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - API: api.md
+theme:
+  name: material
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          setup_commands:
+            - pip install -e .
