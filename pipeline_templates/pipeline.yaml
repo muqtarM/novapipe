@@ -1,0 +1,12 @@
+tasks:
+  - name: analyze
+    task: analyze_data
+    params:
+      input_path: "/data/input.csv"
+
+  - name: report
+    task: print_message
+    params:
+      message: "Read {{ row_count }} rows and {{ column_count }} columns; output at {{ output_path }}"
+    depends_on:
+      - analyze

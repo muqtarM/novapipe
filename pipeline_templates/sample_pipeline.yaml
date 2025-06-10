@@ -1,0 +1,5 @@
+tasks:
+  - name: HelloWorld
+    task: print_message
+    params:
+      message: "Hello, NovaPipe!"
