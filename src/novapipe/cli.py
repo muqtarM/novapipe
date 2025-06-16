@@ -1,14 +1,25 @@
+import json
 import os
 import shutil
+import time
+import re
+import textwrap
+
 import click
 import yaml
+from pathlib import Path
 import inspect as _inspect
 import asyncio
 import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-from .runner import PipelineRunner
+from .runner import PipelineRunner, PIPELINE_STATUS, PIPELINE_DURATION
 from .tasks import task_registry, load_plugins
+from .tasks import set_plugin_pins
 from .logging_conf import configure_logging
+from typing import List, Dict, Any
 # try:
 #     # Python 3.8+
 #     from importlib.metadata import distributions
@@ -75,13 +86,40 @@ tasks:
     default=None,
     help="If set, start a Prometheus metrics server on this port.",
 )
-def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int) -> None:
+@click.option(
+    "--metrics-path", "-p",
+    type=str,
+    default="/metrics",
+    show_default=True,
+    help="HTTP path under which to expose metrics.",
+)
+@click.option(
+    "--plugin-version",
+    "plugin_versions",
+    metavar="DIST==VERSION",
+    multiple=True,
+    help="Pin a plugin distribution to a version, e.g. novapipe-foo==0.2.1"
+)
+def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int, metrics_path: str,
+        plugin_versions: Any) -> None:
     """Run a pipeline YAML file."""
     with open(pipeline_file) as f:
         data = yaml.safe_load(f)
 
+    # Parse and set plugin-version pins before loading
+    pins: Dict[str, str] = {}
+    for pv in plugin_versions:
+        if "==" not in pv:
+            click.echo(f"❌ Invalid --plugin-version format: {pv!r}. Expected DIST==VERSION", err=True)
+            raise SystemExit(1)
+        dist, ver = pv.split("==", 1)
+        pins[dist] = ver
+    set_plugin_pins(pins)
     load_plugins()
-    runner = PipelineRunner(data)
+
+    # Derive a pipeline name from the file, e.g. 'pipeline.yaml' -> 'pipeline'
+    pipeline_name = os.path.splitext(os.path.basename(pipeline_file))[0]
+    runner = PipelineRunner(data, pipeline_name=pipeline_name)
 
     # Parse CLI vars and seed runner.context
     for var_pair in vars:
@@ -91,14 +129,44 @@ def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int) ->
         key, val = var_pair.split("=", 1)
         runner.context[key] = val
 
-    if metrics_port:
-        from prometheus_client import start_http_server
-        start_http_server(metrics_port)
-        click.echo(f"📊 Metrics available at http://localhost:{metrics_port}/metrics")
-
+    start = time.time()
     try:
+        # Start metrics server if requested, on the configured path
+        if metrics_port:
+            class _MetricsHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == metrics_path:
+                        self.send_response(200)
+                        self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+                        self.end_headers()
+                        self.wfile.write(generate_latest())
+                    else:
+                        self.send_response(404)
+
+            httpd = HTTPServer(("0.0.0.0", metrics_port), _MetricsHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            click.echo(f"📊 Metrics available at http://localhost:{metrics_port}{metrics_path}")
+
+        # Measure overall pipeline duration & status
+        start = time.time()
         summary = runner.run()  # now returns PipelineRunSummary, with seeded context used in templates
+        dur = time.time() - start
+
+        # Record pipeline-level metrics
+        PIPELINE_STATUS.labels(pipeline=pipeline_name, status="success").inc()
+        PIPELINE_DURATION.labels(pipeline=pipeline_name).observe(dur)
+
         click.echo("✅ Pipeline completed (check logs for details).")
+
+        # If we're serving metrics, keep the process alive until Ctrl+C
+        if metrics_port:
+            click.echo("🔒 Metrics server still running. Press Ctrl+C to stop.")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                click.echo("\n👋 Shutting down metrics server and exiting.")
 
         if summary_path:
             # Write JSON summary to disk
@@ -109,8 +177,67 @@ def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int) ->
                 json.dump(out, jf, indent=2)
             click.echo(f"📝 Summary written to {summary_path}")
     except Exception as e:
+        # Record pipeline failure metric
+        dur = time.time() - start
+        PIPELINE_STATUS.labels(pipeline=pipeline_name, status="failed").inc()
+        PIPELINE_DURATION.labels(pipeline=pipeline_name).observe(dur)
+
         click.echo(f"❌ Pipeline failed: {e}", err=True)
         raise SystemExit(1)
+
+
+@cli.command("report")
+@click.argument(
+    "summary_json",
+    type=click.Path(exists=True, dir_okay=False),
+)
+def report(summary_json):
+    """
+    Read a summary JSON (as written by --summary-json) and print a table:
+        name    status  attempts    duration(s)     error
+    """
+    # Load the JSON
+    with open(summary_json) as f:
+        data = json.load(f)
+
+    tasks: List[Dict[str, Any]] = data.get("tasks", [])
+    if not tasks:
+        click.echo("No tasks found in summary.", err=True)
+        return
+
+    # Prepare rows
+    headers = ["Name", "Status", "Attempts", "Duration(s)", "Error"]
+    rows = []
+    for t in tasks:
+        rows.append([
+            t.get("name", ""),
+            t.get("status", ""),
+            str(t.get("attempts", "")),
+            f"{t.get('duration_secs', 0):.3f}",
+            t.get("error") or "",
+        ])
+
+    # Try using tabulate if available
+    try:
+        from tabulate import tabulate
+        table = tabulate(rows, headers=headers, tablefmt="github")
+        click.echo(table)
+    except ImportError:
+        # Fallback to simple padding
+        # compute max widths
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        # header line
+        hdr = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+        click.echo(hdr)
+        click.echo("-" * len(hdr))
+        # rows
+        for row in rows:
+            line = "  ".join(row[i].ljust(widths[i]) for i in range(len(headers)))
+            click.echo(line)
 
 
 @cli.command()
@@ -169,6 +296,41 @@ def describe(task_name: str):
         click.echo("Plugin Metadata:")
         click.echo(f" • Distribution: {info['distribution']} (v{info['version']})")
         click.echo(f" • Module:       {func.__module__}")
+
+
+@cli.command("tutorial")
+@click.argument("task_name")
+def tutorial(task_name):
+    """
+    Emit a "Try-me" pipeline YAML snippet for TASK_NAME.
+    """
+    load_plugins()
+    func = task_registry.get(task_name)
+    if not func:
+        click.echo(f"❌ Task {task_name!r} not found.", err=True)
+        raise SystemExit(1)
+
+    doc = _inspect.getdoc(func) or ""
+    # 1) Try to extract an Example: block
+    # We look for lines starting with "Example:" and take the indented block after it.
+    example_match = re.search(
+        r"Example:\s*\n((?:[ \t]+.*\n?)+)", doc, flags=re.IGNORECASE
+    )
+    if example_match:
+        snippet = textwrap.dedent(example_match.group(1))
+        click.echo("Here's a usage example from the docstring:\n")
+        click.echo(snippet.rstrip())
+        return
+
+    # 2) Fallback: minimal skeleton
+    click.echo(f"# Demo pipeline for `{task_name}`\n")
+    click.echo("tasks:")
+    click.echo(f"  - name: example_{task_name}")
+    click.echo(f"    task: {task_name}")
+    click.echo("    params:")
+    click.echo("      # TODO: fill in parameters for this task")
+    click.echo("\n# Run with:")
+    click.echo(f"#   novapipe run pipeline.yaml")
 
 
 @cli.group()
@@ -235,8 +397,102 @@ def hello_{plugin_name}(params: dict):
     click.echo("   • git init && git add . && git commit -m 'Initial plugin scaffold'")
 
 
+@plugin.command("ci-template")
+@click.argument(
+    "output_path",
+    type=click.Path(dir_okay=False, writable=True),
+    default=".github/workflows/publish-plugin.yml",
+)
+def plugin_ci_template(output_path):
+    """
+    Scaffold a GitHub Actions workflow to build, test, and publish this plugin.
+    """
+    template = """\
+name: Publish NovaPipe Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on any tag like v1.2.3
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'  # or matrix 3.8–3.12
+
+      - name: Install Poetry
+        run: |
+          pip install poetry
+
+      - name: Configure PyPI token
+        run: |
+          poetry config pypi-token.pypi ${{{{ secrets.PYPI_API_TOKEN }}}}
+
+      - name: Install dependencies
+        run: |
+          poetry install --no-dev
+
+      - name: Run tests
+        run: |
+          poetry run pytest --cov=.
+
+      - name: Build distribution
+        run: |
+          poetry build
+
+      - name: Publish to PyPI
+        run: |
+          poetry publish --no-interaction --username __token__ --password ${{{{ secrets.PYPI_API_TOKEN }}}}
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{{{ github.ref_name }}}}
+"""
+    # Ensure parent directories exist
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w") as f:
+        f.write(template)
+    click.echo(f"✅ CI workflow scaffolded to {output_path}")
+    click.echo("👉 Next steps:")
+    click.echo("   • Add PYPI_API_TOKEN as a secret in your repo settings")
+    click.echo("   • Commit and push this file to `.github/workflows/`")
+    click.echo("   • Tag a new release (`git tag v0.1.0 && git push --tags`) to trigger it")
+
+
 @plugin.command("list")
-def plugin_list():
+@click.option(
+    "--dist",
+    "dists",
+    metavar="DIST",
+    multiple=True,
+    help="Only show plugins from this distribution (can repeat).",
+)
+@click.option(
+    "--task",
+    "tasks_filter",
+    metavar="TASK_SUBSTR",
+    multiple=True,
+    help="Only show entries whose task name contains this substring (can repeat).",
+)
+@click.option(
+    "--source",
+    "sources",
+    metavar="MODULE_SUBSTR",
+    multiple=True,
+    help="Only show entries whose module path contains this substring (can repeat).",
+)
+def plugin_list(dists, tasks_filter, sources):
     """
     List all installed NovaPipe plugins (distribution, version, module, tasks).
     """
@@ -251,11 +507,20 @@ def plugin_list():
                 # ep.name is the entry-point alias (i.e. the task name)
                 task_name = ep.name
                 module = ep.value
+
+                # Apply filters immediately
+                if dists and name not in dists:
+                    continue
+                if tasks_filter and not any(f in task_name for f in tasks_filter):
+                    continue
+                if sources and not any(s in module for s in sources):
+                    continue
+
                 key = f"{name} (v{version})"
                 plugins.setdefault(key, []).append((task_name, module))
 
     if not plugins:
-        click.echo("No NovaPipe plugins installed.")
+        click.echo("No matching NovaPipe plugins installed.")
         return
 
     click.echo("Installed NovaPipe plugins:")
@@ -293,6 +558,113 @@ def dag(pipeline_file, export_dot):
     else:
         click.echo("🚀 NovaPipe DAG:")
         runner.print_dag()
+
+
+@cli.group("repo")
+def repo():
+    """
+    Manage CI/CD workflows for the NovaPipe repository itself.
+    """
+    pass
+
+
+@repo.command("ci-template")
+@click.argument(
+    "output_path",
+    type=click.Path(dir_okay=False, writable=True),
+    default=".github/workflows/release.yml",
+)
+def repo_ci_template(output_path):
+    """
+    Scaffold a GitHub Actions workflow for canary (TestPyPI) and stable (PyPI) releases.
+    """
+    template = """\
+name: Release NovaPipe
+
+on:
+  push:
+    branches:
+      - main
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  canary:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Configure TestPyPI token
+        run: poetry config repositories.testpypi https://test.pypi.org/legacy/ && \\
+             poetry config pypi-token.testpypi ${{{{ secrets.TESTPYPI_API_TOKEN }}}}
+
+      - name: Install dependencies
+        run: poetry install --no-dev
+
+      - name: Bump to canary version
+        # e.g. from 1.2.3 to 1.2.4-dev$(date +%Y%m%d%H%M)
+        run: |
+          base=$(poetry version -s)
+          stamp=$(date +%Y%m%d%H%M)
+          poetry version "${{ base }}-dev${{ stamp }}"
+
+      - name: Build distribution
+        run: poetry build
+
+      - name: Publish to TestPyPI
+        run: |
+          poetry publish --repository testpypi --username __token__ \\
+            --password ${{{{ secrets.TESTPYPI_API_TOKEN }}}}
+
+  stable:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: canary
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Configure PyPI token
+        run: poetry config pypi-token.pypi ${{{{ secrets.PYPI_API_TOKEN }}}}
+
+      - name: Install dependencies
+        run: poetry install --no-dev
+
+      - name: Build distribution
+        run: poetry build
+
+      - name: Publish to PyPI
+        run: |
+          poetry publish --no-interaction --username __token__ \\
+            --password ${{{{ secrets.PYPI_API_TOKEN }}}}
+"""
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(template)
+    click.echo(f"✅ Repository CI workflow scaffolded to {output_path}")
+    click.echo("👉 Next steps:")
+    click.echo("   • Add secrets TESTPYPI_API_TOKEN & PYPI_API_TOKEN in Settings → Secrets")
+    click.echo("   • Commit and push this file to .github/workflows/")
+    click.echo("   • Pushing to main creates a TestPyPI canary; tagging vX.Y.Z on GitHub publishes to PyPI")
 
 
 if __name__ == '__main__':

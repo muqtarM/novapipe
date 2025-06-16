@@ -23,6 +23,21 @@ class TaskModel(BaseModel):
     # Jinja2 expression controlling whether to run this task
     run_if: Optional[str] = Field(default=None)
 
+    # Jinja2 expression controlling whether "not" to run this task
+    run_unless: Optional[str] = Field(default=None)
+
+    # If this task fails, all tasks depending on it will be skipped
+    skip_downstream_on_failure: bool = Field(default=False)
+
+    # Per-task environment variables (templates rendered against context)
+    env: Dict[str, Any] = Field(default_factory=dict)
+
+    # Group name for resource-based throttling
+    resource_tag: Optional[str] = Field(default=None)
+
+    # Max simultaneous tasks with the same resource_tag
+    max_concurrency: Optional[int] = Field(default=None, ge=1)
+
     class Config:
         # Accept the alias key in input
         allow_population_by_field_name = True

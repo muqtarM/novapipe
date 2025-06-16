@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import importlib
 import tempfile
+from importlib_metadata import distributions, EntryPoint
 from typing import Callable, Dict, Any
 import random
 
 # Global registry of tasks
 task_registry: Dict[str, Callable[[dict], None]] = {}
+
+# global pins: dist_name -> version
+_plugin_pins: Dict[str, str] = {}
+
+
+def set_plugin_pins(pins: Dict[str, str]) -> None:
+    """
+    pins: mapping of distribution name -> version to pin for that plugin.
+    Example: {'novapipe-foo': '0.2.1'}
+    """
+    global _plugin_pins
+    _plugin_pins = pins
 
 
 def task(func: Callable[[dict], None]) -> Callable[[dict], None]:
@@ -28,26 +42,51 @@ def load_plugins() -> None:
     Discover and load external plugins via entry point group 'novapipe.plugins'.
     Plugins should define entry_points in their own pyproject.
     """
-    try:
-        # Python 3.8+ stdlib
-        from importlib.metadata import entry_points
-    except ImportError:
-        # Older Python / importlib_metadata back-compat
-        from importlib_metadata import entry_points
 
-    # Try the new API: entry_points(group=...)
-    try:
-        eps = entry_points(group="novapipe.plugins")
-    except TypeError:
-        # Fallback for older importlib.metadata that returns a dict
-        all_eps = entry_points()
-        eps = all_eps.get("novapipe.plugins", [])
+    # Gather all (dist_name, dist_version, entry_point) tuples
+    ep_map: Dict[str, list[tuple[str, str, EntryPoint]]] = {}
+    for dist in distributions():
+        dist_name = dist.metadata.get("Name", dist.name)
+        dist_version = dist.version
+        for ep in dist.entry_points:
+            if ep.group == "novapipe.plugins":
+                ep_map.setdefault(ep.name, []).append((dist_name, dist_version, ep))
 
-    for ep in eps:
-        module_name = ep.value if hasattr(ep, "value") else ep.module  # e.g. "novapipe_foo.tasks"
-        if module_name in sys.modules:
-            continue
-        importlib.import_module(module_name)
+    # Resolve and register
+    errors: list[str] = []
+    for task_name, candidates in ep_map.items():
+        if len(candidates) == 1:
+            dist_name, dist_version, ep = candidates[0]
+        else:
+            # multiple candidates -> need pin
+            # find matches among candidates
+            matched = [
+                (d, v, e) for (d, v, e) in candidates
+                if _plugin_pins.get(d) == v
+            ]
+            if len(matched) == 1:
+                dist_name, dist_version, ep = matched[0]
+            else:
+                # build a helpful error message
+                opts = ", ".join(f"{d}=={v}" for d, v, _ in candidates)
+                errors.append(
+                    f"Task '{task_name}' is provided by multiple plugins: {opts}. "
+                    f"Pin one with --plugin-version DIST==VERSION."
+                )
+                continue
+
+        # load and register
+        func = ep.load()
+        if task_name in task_registry:
+            # overriding a built-in or earlier plugin; warn or allow if pinned
+            logging.getLogger("novapipe").warning(
+                f"Task '{task_name}' from plugin {dist_name}=={dist_version} "
+                f"is overriding existing registration"
+            )
+        task_registry[task_name] = func
+
+    if errors:
+        raise RuntimeError("Plugin load errors:\n  " + "\n  ".join(errors))
 
 
 # ──────────────── Built-in Tasks ────────────────

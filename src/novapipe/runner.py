@@ -1,10 +1,12 @@
 import asyncio
+import os
+from asyncio import Semaphore
 import logging
 import jinja2
 import time
 from collections import defaultdict, deque
-from typing import Dict, Set, List, Any, Optional
-from prometheus_client import Counter, Histogram
+from typing import Dict, Set, List, Any, Optional, Union
+from prometheus_client import Counter, Histogram, Gauge
 
 from .tasks import task_registry, load_plugins
 from .models import Pipeline, TaskModel
@@ -15,13 +17,25 @@ logger = logging.getLogger("novapipe")
 TASK_STATUS = Counter(
     "novapipe_task_status_total",
     "Count of task executions by status",
-    ["task", "status"],
+    ["pipeline", "task", "status"],
 )
 
 TASK_DURATION = Histogram(
     "novapipe_task_duration_seconds",
     "Task execution duration",
-    ["task", "status"],
+    ["pipeline", "task", "status"],
+)
+
+PIPELINE_STATUS = Counter(
+    "novapipe_pipeline_status_total",
+    "Count of pipeline runs by status",
+    ["pipeline", "status"],
+)
+
+PIPELINE_DURATION = Histogram(
+    "novapipe_pipeline_duration_seconds",
+    "Pipeline run duration in seconds",
+    ["pipeline"],
 )
 
 
@@ -90,6 +104,7 @@ class PipelineRunSummary:
         ts.status = "skipped"
         ts.duration_secs = 0.0
         ts.error = None
+        ts.start_time = time.time()
         self.tasks[name] = ts
 
     def to_list(self) -> List[Dict[str, Any]]:
@@ -100,11 +115,14 @@ class PipelineRunner:
     """
     Executes a validated Pipeline of Steps, supporting async tasks.
     """
-    def __init__(self, raw_data: dict) -> None:
+    def __init__(self, raw_data: dict, pipeline_name: str) -> None:
         # 1. Parse & validate YAML into Pydantic models
         self.pipeline = Pipeline.model_validate(raw_data)
         # 2. Build in-memory DAG structures
         self._build_graph()
+        self.pipeline_name = pipeline_name
+
+        # Prepare summary
         self._summary = PipelineRunSummary()
 
         # Shared context: task_name → return_value
@@ -123,6 +141,20 @@ class PipelineRunner:
             'bool': bool,
             'len': len,
         })
+
+        # Build semaphore for any tasks that declared max_concurrency
+        self._resource_semaphores: Dict[Optional[str], Semaphore] = {}
+        for t in self.tasks_by_name.values():
+            tag = t.resource_tag
+            if tag and t.max_concurrency:
+                # only one semaphore per tag
+                if tag in self._resource_semaphores:
+                    # pick the smallest limit if multiple tasks share the tag
+                    existing = self._resource_semaphores[tag]._value
+                    limit = min(existing, t.max_concurrency)
+                    self._resource_semaphores[tag] = Semaphore(limit)
+                else:
+                    self._resource_semaphores[tag] = Semaphore(t.max_concurrency)
 
     def _build_graph(self):
         """
@@ -198,6 +230,24 @@ class PipelineRunner:
 
         return layers
 
+    def _render_env(self, raw_env: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Recursively render each value in raw_env as a Jinja2 template
+        and return a flat dict of string->string to inject into os.environ.
+        """
+        def render_val(v: Any) -> str:
+            if isinstance(v, str):
+                tmpl = self._jinja_env.from_string(v)
+                try:
+                    return tmpl.render(**self.context)
+                except jinja2.UndefinedError as e:
+                    raise RuntimeError(f"Env template error in '{v}': {e}")
+            else:
+                # Non-string values get cast to str
+                return str(v)
+
+        return {k: render_val(v) for k, v in raw_env.items()}
+
     def _render_params(self, raw_params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Recursively walk raw_params and render any string values as Jinja2 templates
@@ -240,12 +290,38 @@ class PipelineRunner:
         task_model = self.tasks_by_name[name]
         func = task_registry[task_model.task]
 
+        # ---- 0) SKIP-DOWNSTREAM-ON-FAILURE ----
+        # If any dependency declared skip_downstream_on_failure=True and failed,
+        # then skip this task.
+        for dep in task_model.depends_on:
+            dep_model = self.tasks_by_name[dep]
+            if dep_model.skip_downstream_on_failure:
+                dep_summary = self._summary.tasks.get(dep)
+                if dep_summary and dep_summary.status != "success":
+                    logger.info(
+                        f"Task '{name}' skipped because dependency '{dep}' failed "
+                        f"and skip_downstream_on_failure=True."
+                    )
+                    self._summary.record_skipped(name)
+                    self.context[name] = None
+                    return
+
         # ---- 1) CONDITIONAL EXECUTION ----
-        # If `run_if` is provided, render it against self.context, then interpret.
+        # A) run_unless: if provided and truthy -> skip
+        if task_model.run_unless:
+            tmpl_un = self._jinja_env.from_string(task_model.run_unless)
+            val_un = tmpl_un.render(**self.context).strip().lower()
+            if val_un in ("true", "1", "yes"):
+                logger.info(f"Task '{name}' skipped because run_unless evaluated to '{val_un}'.")
+                self._summary.record_skipped(name)
+                self.context[name] = None
+                return
+
+        # B) run_if: if provided and falsy -> skip
         if task_model.run_if:
             try:
-                tmpl = self._jinja_env.from_string(task_model.run_if)
-                rendered = tmpl.render(**self.context)
+                tmpl_if = self._jinja_env.from_string(task_model.run_if)
+                rendered = tmpl_if.render(**self.context)
             except jinja2.UndefinedError as e:
                 raise RuntimeError(f"Template error in run_if for '{name}': {e}")
 
@@ -275,89 +351,176 @@ class PipelineRunner:
         timeout = task_model.timeout  # None or float
         ignore_failure = bool(task_model.ignore_failure)
 
-        # Initialize summary for this task
-        self._summary.record_start(name)
+        # Prepare execution as an inner coroutine (to allow semaphore)
+        async def execute():
+            # ---- ENVIRONMENT INJECTION ----
+            raw_env = task_model.env or {}
+            if raw_env:
+                try:
+                    env_vars = self._render_env(raw_env)
+                except Exception as e:
+                    raise RuntimeError(f"Error rendering env for task '{name}': {e}")
 
-        attempt = 0
-
-        while True:
-            attempt += 1
-            if asyncio.iscoroutinefunction(func):
-                coro = func(params)
+                # Save current values
+                _old = {k: os.environ.get(k) for k in env_vars}
+                # Inject new ones
+                os.environ.update(env_vars)
             else:
-                # Offload sync function to a threadpool so it doesn't block the loop
-                loop = asyncio.get_running_loop()
-                coro = loop.run_in_executor(None, func, params)
+                env_vars = {}
+                _old = {}
 
-            try:
-                # capture whatever the task returned
-                start = time.time()
-                if timeout and timeout > 0:
-                    result = await asyncio.wait_for(coro, timeout=timeout)
+            self._summary.record_start(name)
+
+            attempt = 0
+
+            while True:
+                attempt += 1
+                if asyncio.iscoroutinefunction(func):
+                    coro = func(params)
                 else:
-                    result = await coro
-                dur = time.time() - start
+                    # Offload sync function to a threadpool so it doesn't block the loop
+                    loop = asyncio.get_running_loop()
+                    coro = loop.run_in_executor(None, func, params)
 
-                # record metrics
-                TASK_STATUS.labels(task=name, status="success").inc()
-                TASK_DURATION.labels(task=name, status="success").observe(dur)
-
-                # Record success and store result in context
-                logger.info(f"Task '{name}' succeeded on attempt {attempt}/{max_attempts}")
-                self._summary.record_success(name, attempt)
-
-                # 📦 unpack dict‐returns into context, or bind single value
-                if isinstance(result, dict):
-                    for k, v in result.items():
-                        if k in self.context:
-                            logger.warning(f"Context key {k!r} overwritten by task '{name}'")
-                        self.context[k] = v
-                else:
-                    self.context[name] = result
-
-                return
-            except asyncio.TimeoutError as te:
-                # Timeout on this attempt
-                if attempt >= max_attempts:
-                    msg = f"Task '{name}' timed out after {timeout}s (attempt {attempt}/{max_attempts})"
-                    if task_model.ignore_failure:
-                        logger.error(msg + " — but ignore_failure=True, continuing.")
-                        self._summary.record_failed_ignored(name, attempt, te)
-                        return
+                try:
+                    # capture whatever the task returned
+                    start = time.time()
+                    if timeout and timeout > 0:
+                        result = await asyncio.wait_for(coro, timeout=timeout)
                     else:
-                        logger.error(msg)
-                        self._summary.record_failed_abort(name, attempt, te)
-                        raise RuntimeError(msg)
-                else:
-                    # Log a warning and sleep before next attempt
-                    logger.warning(
-                        f"⏱️ Task '{name}' timed out after {timeout}s "
-                        f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s..."
-                    )
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                        result = await coro
+                    dur = time.time() - start
 
-            except Exception as exc:
-                # Real exception from the task body
-                if attempt >= max_attempts:
-                    msg = f"Task '{name}' (func={task_model.task}) failed permanently with: {exc!r}"
-                    if task_model.ignore_failure:
-                        logger.error(msg + " — but ignore_failure=True, continuing.")
-                        self._summary.record_failed_ignored(name, attempt, exc)
-                        # Even though failure is ignored, we set context[name] = None
-                        self.context[name] = None
-                        return
+                    # record metrics
+                    TASK_STATUS.labels(
+                        pipeline=self.pipeline_name,
+                        task=name,
+                        status="success"
+                    ).inc()
+                    TASK_DURATION.labels(
+                        pipeline=self.pipeline_name,
+                        task=name,
+                        status="success"
+                    ).observe(dur)
+
+                    # Record success and store result in context
+                    logger.info(f"Task '{name}' succeeded on attempt {attempt}/{max_attempts}")
+                    self._summary.record_success(name, attempt)
+
+                    # 📦 unpack dict‐returns into context, or bind single value
+                    if isinstance(result, dict):
+                        for k, v in result.items():
+                            if k in self.context:
+                                logger.warning(f"Context key {k!r} overwritten by task '{name}'")
+                            self.context[k] = v
                     else:
-                        logger.error(msg)
-                        self._summary.record_failed_abort(name, attempt, exc)
-                        raise
-                else:
-                    logger.warning(
-                        f"⚠️ Task '{name}' (func={task_model.task}) failed with {exc!r} "
-                        f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s..."
-                    )
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                        self.context[name] = result
+
+                    return
+                except asyncio.TimeoutError as te:
+                    # Timeout on this attempt
+                    if attempt >= max_attempts:
+                        msg = f"Task '{name}' timed out after {timeout}s (attempt {attempt}/{max_attempts})"
+                        if ignore_failure:
+                            logger.error(msg + " — but ignore_failure=True, continuing.")
+                            self._summary.record_failed_ignored(name, attempt, te)
+                            # record metrics
+                            TASK_STATUS.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_ignored"
+                            ).inc()
+                            TASK_DURATION.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_ignored"
+                            ).observe(time.time() - self._summary.tasks[name].start_time)
+                            return
+                        else:
+                            logger.error(msg)
+                            self._summary.record_failed_abort(name, attempt, te)
+                            TASK_STATUS.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_abort"
+                            ).inc()
+                            TASK_DURATION.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_abort"
+                            ).observe(time.time() - self._summary.tasks[name].start_time)
+                            raise RuntimeError(msg)
+                    else:
+                        # Log a warning and sleep before next attempt
+                        logger.warning(
+                            f"⏱️ Task '{name}' timed out after {timeout}s "
+                            f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s..."
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+
+                except Exception as exc:
+                    # Real exception from the task body
+                    if attempt >= max_attempts:
+                        msg = f"Task '{name}' (func={task_model.task}) failed permanently with: {exc!r}"
+                        if task_model.ignore_failure:
+                            logger.error(msg + " — but ignore_failure=True, continuing.")
+                            self._summary.record_failed_ignored(name, attempt, exc)
+                            TASK_STATUS.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_ignored"
+                            ).inc()
+                            TASK_DURATION.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_ignored"
+                            ).observe(time.time() - self._summary.tasks[name].start_time)
+                            # Even though failure is ignored, we set context[name] = None
+                            self.context[name] = None
+                            return
+                        else:
+                            logger.error(msg)
+                            self._summary.record_failed_abort(name, attempt, exc)
+                            TASK_STATUS.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_abort"
+                            ).inc()
+                            TASK_DURATION.labels(
+                                pipeline=self.pipeline_name,
+                                task=name,
+                                status="failed_abort"
+                            ).observe(time.time() - self._summary.tasks[name].start_time)
+                            raise
+                    else:
+                        logger.warning(
+                            f"⚠️ Task '{name}' (func={task_model.task}) failed with {exc!r} "
+                            f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s..."
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+
+                finally:
+                    # Restore environment
+                    if env_vars:
+                        for k, old_val in _old.items():
+                            if old_val is None:
+                                os.environ.pop(k, None)
+                            else:
+                                os.environ[k] = old_val
+
+        # Acquire semaphore if resource_tag is set
+        sem = None
+        tag = task_model.resource_tag
+        if tag and tag in self._resource_semaphores:
+            sem = self._resource_semaphores[tag]
+
+        if sem:
+            async with sem:
+                await execute()
+        else:
+            await execute()
 
     async def _run_layer(self, names: List[str]) -> None:
         """
