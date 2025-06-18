@@ -7,8 +7,3 @@ theme:
   name: material
 plugins:
   - search
-  - mkdocstrings:
-      handlers:
-        python:
-          setup_commands:
-            - pip install -e .
