@@ -5,11 +5,17 @@ import logging
 import jinja2
 import time
 from collections import defaultdict, deque
-from typing import Dict, Set, List, Any, Optional, Union
+from typing import Dict, Set, List, Any, Optional, Union, Deque
 from prometheus_client import Counter, Histogram, Gauge
 
 from .tasks import task_registry, load_plugins
 from .models import Pipeline, TaskModel
+
+try:
+    import resource
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False
 
 logger = logging.getLogger("novapipe")
 
@@ -37,6 +43,64 @@ PIPELINE_DURATION = Histogram(
     "Pipeline run duration in seconds",
     ["pipeline"],
 )
+
+
+def limit_and_call(fn, params, cpu_time=None, memory=None):
+    """
+    Apply RLIMIT_CPU and RLIMIT_AS (if given), then call fn(params).
+    If fn(params) returns a coroutine, run it via asyncio.run().
+    Return the final result.
+    """
+    if _HAS_RESOURCE:
+        # Apply CPU limit
+        if cpu_time is not None:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_time, cpu_time))
+        # Apply memory limit (address space)
+        if memory is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    else:
+        # Windows or missing resource module: we can't enforce limits
+        if cpu_time is not None or memory is not None:
+            # only log once per call
+            logger.warning(
+                "Resource limits requested but not supported on this platform—"
+                "skipping cpu_time=%r, memory=%r", cpu_time, memory
+            )
+
+    result = fn(params)
+    if asyncio.iscoroutine(result):
+        # run any coroutine to completion
+        return asyncio.run(result)
+    return result
+
+
+class RateLimiter:
+    """
+    Simple sliding-window rate limiter: up to `rate` calls per `per` seconds.
+    """
+    def __init__(self, rate: float, per: float = 1.0):
+        self.rate = rate
+        self.per = per
+        self.calls: Deque[float] = deque()
+
+    async def acquire(self):
+        now = asyncio.get_running_loop().time()
+        # Remove timestamps older than window
+        while self.calls and self.calls[0] <= now - self.per:
+            self.calls.popleft()
+
+        if len(self.calls) < self.rate:
+            # under limit: record and proceed
+            self.calls.append(now)
+            return
+        # at capacity: compute next allowed time
+        earliest = self.calls[0]
+        wait = earliest + self.per - now
+        await asyncio.sleep(wait)
+        # after waiting, slide window and record
+        now2 = asyncio.get_running_loop().time()
+        self.calls.popleft()
+        self.calls.append(now2)
 
 
 class TaskMetrics:
@@ -120,6 +184,19 @@ class PipelineRunner:
         self.pipeline = Pipeline.model_validate(raw_data)
         # 2. Build in-memory DAG structures
         self._build_graph()
+
+        # Build rate limiters per key
+        self._rate_limiters: Dict[str, RateLimiter] = {}
+        for t in self.tasks_by_name.values():
+            if t.rate_limit is not None:
+                key = t.rate_limit_key or t.name
+                if key in self._rate_limiters:
+                    # pick the lowest rate if multiple tasks share the same key
+                    existing = self._rate_limiters[key].rate
+                    self._rate_limiters[key].rate = min(existing, t.rate_limit)
+                else:
+                    self._rate_limiters[key] = RateLimiter(rate=t.rate_limit, per=1.0)
+
         self.pipeline_name = pipeline_name
 
         # Prepare summary
@@ -306,6 +383,31 @@ class PipelineRunner:
                     self.context[name] = None
                     return
 
+        # ---- BRANCH GATING ----
+        # If this task belongs to a branch, evaluate that branch's Jinja2 expr.
+        branch_name = task_model.branch
+        if branch_name:
+            expr = self.pipeline.branches.get(branch_name, "")
+            try:
+                tmpl = self._jinja_env.from_string(expr)
+                rendered = tmpl.render(**self.context).strip().lower()
+            except jinja2.UndefinedError as e:
+                raise RuntimeError(f"Error evaluating branch '{branch_name}': {e}")
+
+            if rendered not in ("true", "1", "yes"):
+                logger.info(f"Task '{name}' skipped because branch '{branch_name}' = '{rendered}'")
+                self._summary.record_skipped(name)
+                self.context[name] = None
+                return
+
+        # --- RATE-LIMITING ----
+        if task_model.rate_limit is not None:
+            key = task_model.rate_limit_key or task_model.name
+            limiter = self._rate_limiters.get(key)
+            if limiter:
+                logger.debug(f"RateLimiter acquire for key={key} at rate={limiter.rate}/s")
+                await limiter.acquire()
+
         # ---- 1) CONDITIONAL EXECUTION ----
         # A) run_unless: if provided and truthy -> skip
         if task_model.run_unless:
@@ -375,12 +477,31 @@ class PipelineRunner:
 
             while True:
                 attempt += 1
-                if asyncio.iscoroutinefunction(func):
-                    coro = func(params)
-                else:
-                    # Offload sync function to a threadpool so it doesn't block the loop
-                    loop = asyncio.get_running_loop()
-                    coro = loop.run_in_executor(None, func, params)
+                # Always run in executor so resource limits apply
+                loop = asyncio.get_running_loop()
+                coro = loop.run_in_executor(
+                    None,
+                    limit_and_call,
+                    func,
+                    params,
+                    task_model.cpu_time,
+                    task_model.memory,
+                )
+                # if asyncio.iscoroutinefunction(func):
+                #     # async functions can't have resource limits easily; run in a thread
+                #     def _sync_wrapper(p):
+                #         return limit_and_call(func, p)
+                #     coro = func(params)     # async tasks: relay on timeout only
+                # else:
+                #     # Offload sync function to a threadpool so it doesn't block the loop
+                #     loop = asyncio.get_running_loop()
+                #     # wrap sync function so it sets resource limits before calling
+                #     coro = loop.run_in_executor(
+                #         None,
+                #         limit_and_call,
+                #         func,
+                #         params
+                #     )
 
                 try:
                     # capture whatever the task returned

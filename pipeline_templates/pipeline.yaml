@@ -1,12 +1,20 @@
 tasks:
-  - name: analyze
-    task: analyze_data
+  - name: fetch_page1
+    task: call_api
+    rate_limit: 2            # no more than 2 calls/sec
+    rate_limit_key: "api"
     params:
-      input_path: "/data/input.csv"
+      url: "https://example.com/page1"
 
-  - name: report
-    task: print_message
+  - name: fetch_page2
+    task: call_api
+    rate_limit: 2            # shared with fetch_page1
+    rate_limit_key: "api"
     params:
-      message: "Read {{ row_count }} rows and {{ column_count }} columns; output at {{ output_path }}"
+      url: "https://example.com/page2"
+
+  - name: aggregate
+    task: aggregate_results
     depends_on:
-      - analyze
+      - fetch_page1
+      - fetch_page2

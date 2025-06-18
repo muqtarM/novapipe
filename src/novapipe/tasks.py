@@ -6,6 +6,7 @@ import sys
 import importlib
 import tempfile
 from importlib_metadata import distributions, EntryPoint
+import boto3
 from typing import Callable, Dict, Any
 import random
 
@@ -215,3 +216,59 @@ def analyze_data(params):
       "column_count": 10,
       "output_path": "/tmp/novapipe_out.csv",
     }
+
+
+@task
+def upload_file_s3(params: Dict[str, str]) -> str:
+    """
+    Uploads a local file at `path` to S3 bucket/key, returns the S3 URI.
+    """
+    s3 = boto3.client("s3")
+    bucket = params["bucket"]
+    key = params["key"]
+    path = params["path"]
+    s3.upload_file(path, bucket, key)
+    return f"s3://{bucket}/{key}"
+
+
+@task
+def extract_data(params: Dict[str, Any]) -> Any:
+    """
+    Stub extract_data: returns the `source` param so we can see it ran.
+    """
+    return params.get("source")
+
+@task
+def transform_data(params: Dict[str, Any]) -> Any:
+    """
+    Stub transform_data: tags the data as transformed.
+    """
+    src = params.get("source") or params.get("extracted")
+    return f"transformed({src})"
+
+@task
+def load_data(params: Dict[str, Any]) -> str:
+    """
+    Stub load_data: prints and returns a load message.
+    """
+    msg = f"loaded: {params}"
+    print(msg)
+    return msg
+
+
+@task
+def call_api(params: Dict[str, Any]) -> Any:
+    """
+    Stub call_api: pretend to fetch from `url` by returning a marker string.
+    """
+    url = params.get("url", "")
+    return f"fetched:{url}"
+
+
+@task
+def aggregate_results(params: Dict[str, Any]) -> Any:
+    """
+    Stub aggregate_results: just return whatever was passed in.
+    """
+    # If you passed a dict of results, return that; otherwise echo params
+    return params

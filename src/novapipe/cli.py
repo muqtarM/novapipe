@@ -6,6 +6,7 @@ import re
 import textwrap
 
 import click
+import jinja2
 import yaml
 from pathlib import Path
 import inspect as _inspect
@@ -94,6 +95,12 @@ tasks:
     help="HTTP path under which to expose metrics.",
 )
 @click.option(
+    "--ignore-failures",
+    is_flag=True,
+    default=False,
+    help="Globally treat all tasks as ignore_failure=True (unless overridden per-task).",
+)
+@click.option(
     "--plugin-version",
     "plugin_versions",
     metavar="DIST==VERSION",
@@ -101,7 +108,7 @@ tasks:
     help="Pin a plugin distribution to a version, e.g. novapipe-foo==0.2.1"
 )
 def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int, metrics_path: str,
-        plugin_versions: Any) -> None:
+        plugin_versions: Any, ignore_failures: bool) -> None:
     """Run a pipeline YAML file."""
     with open(pipeline_file) as f:
         data = yaml.safe_load(f)
@@ -120,6 +127,13 @@ def run(pipeline_file: str, vars: list, summary_path: str, metrics_port: int, me
     # Derive a pipeline name from the file, e.g. 'pipeline.yaml' -> 'pipeline'
     pipeline_name = os.path.splitext(os.path.basename(pipeline_file))[0]
     runner = PipelineRunner(data, pipeline_name=pipeline_name)
+
+    # If global ignore-failures is set, override each task_model.ignore_failure
+    if ignore_failures:
+        for tm in runner.tasks_by_name.values():
+            # If user explicitly set ignore_failure in YAML to False, respect that
+            if not hasattr(tm, "ignore_failure") or tm.ignore_failure is False:
+                tm.ignore_failure = False
 
     # Parse CLI vars and seed runner.context
     for var_pair in vars:
@@ -287,7 +301,16 @@ def describe(task_name: str):
 
     # Docstring (or placeholder)
     doc = _inspect.getdoc(func) or "(no documentation provided)"
-    click.echo(doc)
+
+    # Render as Markdown if Rich is available, else plain text
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+
+        console = Console()
+        console.print(Markdown(doc))
+    except ImportError:
+        click.echo(doc)
 
     # If this is a plugin task, show where it came from
     info = plugin_info.get(task_name)
@@ -665,6 +688,71 @@ jobs:
     click.echo("   • Add secrets TESTPYPI_API_TOKEN & PYPI_API_TOKEN in Settings → Secrets")
     click.echo("   • Commit and push this file to .github/workflows/")
     click.echo("   • Pushing to main creates a TestPyPI canary; tagging vX.Y.Z on GitHub publishes to PyPI")
+
+
+@cli.command("playground")
+@click.option(
+    "--var", "-D",
+    "vars",
+    metavar="KEY=VAL",
+    multiple=True,
+    help="Seed the playground context with KEY=VAL (can repeat).",
+)
+@click.argument("template", required=False)
+def playground(vars, template):
+    """
+    Interactive Jinja2 playground
+
+    If TEMPLATE is given, renders it once and exits.
+    Otherwise enters a REPL: type templates, ENTER to render, or 'exit' or quit.
+    """
+    # Build the Jinja2 env like NovaPipe uses
+    env = jinja2.Environment(
+        undefined=jinja2.StrictUndefined,
+        autoescape=False,
+    )
+    env.globals.update({'int': int, 'float': float, 'str': str, 'bool': bool, 'len': len})
+
+    # Seed context
+    context = {}
+    for var in vars:
+        if "=" not in var:
+            click.echo(f"❌ Invalid var: {var!r}. Use KEY=VAL.", err=True)
+            return
+        k, v = var.split("=", 1)
+        # Try to parse JSON for numbers/bools/lists, else keep string
+        try:
+            context[k] = json.loads(v)
+        except Exception:
+            context[k] = v
+
+    click.echo(f"🔧 Playground context: {context!r}")
+
+    def render_and_print(tmpl_str: str):
+        try:
+            tmpl = env.from_string(tmpl_str)
+            out = tmpl.render(**context)
+            click.echo(out)
+        except Exception as e:
+            click.echo(f"⚠️  Error: {e}", err=True)
+
+    if template:
+        # One-off render
+        render_and_print(template)
+        return
+
+    # REPL mode
+    click.echo("📝 Enter templates; type 'exit' or Ctrl-D to quit.")
+    while True:
+        try:
+            line = input(">>> ")
+        except (EOFError, KeyboardInterrupt):
+            click.echo("\n👋 Exiting playground.")
+            break
+        if not line or line.strip().lower() in ("exit", "quit"):
+            click.echo("👋 Goodbye.")
+            break
+        render_and_print(line)
 
 
 if __name__ == '__main__':
