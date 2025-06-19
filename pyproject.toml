@@ -17,6 +17,9 @@ tabulate = "^0.9.0"
 rich = "^12.0.0"
 
 [tool.poetry.dev-dependencies]
+mkdocs = "^1.5.0"
+mkdocs-material = "^9.0.0"
+mkdocstrings = "^0.23.0"
 pytest = "^7.0"
 flake8 = "^5.0"
 black = "^24.0"
@@ -29,6 +32,7 @@ novapipe = "novapipe.cli:cli"
 
 [tool.poetry.group.dev.dependencies]
 poetry-dynamic-versioning = "^1.8.2"
+mkdocstrings = {version = ">=0.18", extras = ["python"]}
 
 [build-system]
 requires = ["poetry-core"]

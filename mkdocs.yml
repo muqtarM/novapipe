@@ -1,7 +1,32 @@
 site_name: NovaPipe
-nav:
-  - Home: index.md
-  - Usage: usage.md
-  - API: api.md
+site_description: Lightweight, plugin-driven ETL orchestration in Python
+repo_url: https://github.com/muqtarM/novapipe
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+
 plugins:
   - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          setup_commands:
+            - pip install .
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - CLI Reference: cli.md
+  - Plugin Development: plugin_development.md
+  - Advanced Usage:
+    - Branching: advanced/branching.md
+    - Rate Limiting: advanced/rate_limiting.md
+    - Resource & Env: advanced/resource_env.md
+    - Observability: advanced/observability.md
+  - Contributing: contributing.md
+  - Code of Conduct: CODE_OF_CONDUCT.md
+  - API Reference:
+    - novapipe: reference/novapipe.md

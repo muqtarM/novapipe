@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/novapipe.svg)](https://pypi.org/project/novapipe)  
 [![Build Status](https://github.com/muqtarM/novapipe/actions/workflows/release.yml/badge.svg)](https://github.com/muqtarM/novapipe/actions)  
-[![Coverage Status](https://img.shields.io/codecov/c/github/your-org/novapipe.svg)](https://codecov.io/gh/muqtarM/novapipe)  
+[![Coverage Status](https://img.shields.io/codecov/c/github/muqtarM/novapipe.svg)](https://codecov.io/gh/muqtarM/novapipe)  
 [![Documentation Status](https://readthedocs.org/projects/novapipe/badge/?version=latest)](https://novapipe.readthedocs.io/)  
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
