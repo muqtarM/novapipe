@@ -1,13 +1,23 @@
-# Read the Docs configuration file for MkDocs projects
-# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
-
-# Required
 version: 2
 
-# Set the version of Python and other tools you might need
+# ── Build environment ──
 build:
-  image: latest
-  language: python
-  commands:
-    - pip install mkdocs mkdocs-material mkdocstrings
-    - mkdocs build --site-dir site
+  # Which Ubuntu image to use
+  os: ubuntu-22.04
+  # Which Python to install
+  tools:
+    python: "3.10"
+
+# ── Python installation ──
+python:
+  install:
+    # Install your package so mkdocstrings can import it
+    - method: pip
+      path: .
+    # Install any MkDocs‐related dependencies
+    - requirements: docs/requirements.txt
+
+# ── MkDocs config ──
+mkdocs:
+  # Point to your mkdocs config
+  configuration: mkdocs.yml
